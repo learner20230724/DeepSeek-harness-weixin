@@ -1,12 +1,13 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent, AgentHandle } from '@deepseek-ai/dsh-agent'
 import type {} from '@deepseek-ai/dsh-agent-default-model'
-import { resolveSessionPreset } from '@deepseek-ai/dsh-agent-presets'
+import { agentPresetProjectionDefinition } from '@deepseek-ai/dsh-agent-preset-registry'
 import { parseCommand } from '@deepseek-ai/dsh-commands'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import type {} from '@deepseek-ai/dsh-permission-presets'
 import { SessionId, type SessionEvent } from '@deepseek-ai/dsh-session'
 import type {} from '@deepseek-ai/dsh-session-persistence'
+import type {} from '@deepseek-ai/dsh-system-prompt'
 import {
   WeixinApprovalRegistry,
   type ApprovalCommand,
@@ -61,7 +62,7 @@ export class ConversationManager {
       this.ctx.permissionPresets.resolve(this.config.permissionPreset)
     }
     const headers = await this.ctx.sessionPersistence.list()
-    this.persistedIds = new Set(headers.map(header => String(header.id)))
+    this.persistedIds = new Set(headers.map(snapshot => String(snapshot.header.id)))
   }
 
   /** Process one inbound message after earlier work for the same Weixin user. */
@@ -162,7 +163,7 @@ export class ConversationManager {
       agent.session.header?.cwd ?? this.config.cwd,
     )
     await withTimeout(agent.whenIdle(), this.config.responseTimeoutMs, 'DeepSeek Harness conversation availability')
-    const start = agent.session.events.length
+    const start = agent.session.snapshotEvents().length
     const userMessage = createUserMessage({ content, source: { kind: 'user' } })
     const sendPrompt = sendApprovalPrompt ?? ((text: string) => {
       const to = message.from_user_id?.trim()
@@ -182,7 +183,7 @@ export class ConversationManager {
         agent.cancel({ kind: 'user' })
         throw error
       }
-      return this.collectReply(agent, agent.session.events.slice(start), userMessage.id)
+      return this.collectReply(agent, agent.session.snapshotEvents().slice(start), userMessage.id)
     } finally {
       stopApprovalAnswerer()
     }
@@ -202,7 +203,7 @@ export class ConversationManager {
     if (parsed === undefined) {
       return { kind: 'unknown', available: this.ctx.commands.list(agent).map(command => `/${command.name}`) }
     }
-    const start = agent.session.events.length
+    const start = agent.session.snapshotEvents().length
     const sendPrompt = sendApprovalPrompt ?? ((text: string) => {
       const to = message.from_user_id?.trim()
       if (!to) return Promise.reject(new Error('Weixin approval has no target user'))
@@ -218,7 +219,7 @@ export class ConversationManager {
       controller.abort(new Error(`DeepSeek Harness command timed out after ${this.config.responseTimeoutMs}ms`))
     }, this.config.responseTimeoutMs)
     try {
-      const execution = await this.ctx.commands.execute(agent, line, controller.signal)
+      const execution = await this.ctx.commands.execute(agent, line, [], controller.signal)
       if (execution === undefined) {
         return { kind: 'unknown', available: this.ctx.commands.list(agent).map(command => `/${command.name}`) }
       }
@@ -229,7 +230,7 @@ export class ConversationManager {
         agent.cancel({ kind: 'user' })
         throw error
       }
-      const generated = await this.collectLatestReply(agent, agent.session.events.slice(start))
+      const generated = await this.collectLatestReply(agent, agent.session.snapshotEvents().slice(start))
       const resultText = execution.result.kind === 'error'
         ? `命令执行失败：${execution.result.text}`
         : execution.result.text?.trim() || `命令 /${parsed.name} 已执行。`
@@ -341,16 +342,22 @@ export class ConversationManager {
     const current = this.ctx.agentDefaultModel.currentSelection()
     const agentOptions = { provider: current.provider, model: current.model }
     if (this.persistedIds.has(id)) {
-      const inspected = await this.ctx.sessionPersistence.inspect(sessionId)
-      const agentPreset = resolveSessionPreset({
-        header: inspected.meta,
-        events: inspected.events,
-      }) ?? this.resolveAgentPreset()
+      const stored = await this.ctx.sessionPersistence.open(sessionId, 'read')
+      let agentPreset: string
+      try {
+        const { events } = await stored.read()
+        agentPreset = events.reduce(
+          agentPresetProjectionDefinition.apply,
+          agentPresetProjectionDefinition.init(stored.header),
+        ) ?? this.resolveAgentPreset()
+      } finally {
+        await stored.close()
+      }
       try {
         return this.ownAgent(await this.ctx.agents.resume({
           resumeSessionId: sessionId,
           agentOptions,
-          setup: agentCtx => this.setupAgent(agentCtx, agentPreset),
+          setup: (agentCtx, agent) => this.setupAgent(agentCtx, agent, agentPreset),
         }))
       } catch (error) {
         const raced = this.ctx.agents.get(sessionId)
@@ -366,7 +373,7 @@ export class ConversationManager {
         sessionId,
         meta: { cwd: this.config.cwd, agentPreset },
         agentOptions,
-        setup: agentCtx => this.setupAgent(agentCtx, agentPreset, this.config.permissionPreset),
+        setup: (agentCtx, agent) => this.setupAgent(agentCtx, agent, agentPreset, this.config.permissionPreset),
       })
     } catch (error) {
       const raced = this.ctx.agents.get(sessionId)
@@ -374,10 +381,6 @@ export class ConversationManager {
       throw error
     }
     this.persistedIds.add(id)
-    handle.agent.inject(createUserMessage({
-      content: [{ type: 'text', text: this.config.systemPrompt }],
-      source: { kind: 'plugin', plugin: 'deepseek-harness-weixin', form: 'instructions' },
-    }))
     return this.ownAgent(handle)
   }
 
@@ -393,11 +396,12 @@ export class ConversationManager {
     return this.config.agentPreset ?? this.ctx.agentPresets.defaultId
   }
 
-  private async setupAgent(agentCtx: Context, agentPreset: string, permissionPreset?: string): Promise<void> {
+  private async setupAgent(agentCtx: Context, agent: Agent, agentPreset: string, permissionPreset?: string): Promise<void> {
     await this.ctx.agentPresets.mount(agentCtx, agentPreset)
+    agentCtx.systemPrompt.section({
+      name: 'weixin-channel', order: 80, text: this.config.systemPrompt, interpolate: false,
+    })
     if (permissionPreset !== undefined) {
-      const agent = agentCtx.agent
-      if (agent === undefined) throw new Error('weixin-channel: Agent setup context has no Agent')
       this.ctx.permissionPresets.set(agent.session, permissionPreset)
     }
   }

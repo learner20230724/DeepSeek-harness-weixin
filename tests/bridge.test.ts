@@ -91,7 +91,7 @@ function agentContext(replyText = 'model reply', includeToolStep = false, stallR
   const agent = {
     status: 'idle',
     options: { provider: 'deepseek', model: 'deepseek-chat' },
-    session: { events, header: { cwd: '/tmp/weixin-test' } },
+    session: { snapshotEvents: () => events, events, header: { cwd: '/tmp/weixin-test' } },
     ctx: { on: vi.fn(() => vi.fn()) },
     inject: vi.fn(),
     followup: vi.fn((userMessage: { id: string }) => {
@@ -144,8 +144,8 @@ function agentContext(replyText = 'model reply', includeToolStep = false, stallR
     agentPresets: { defaultId: 'standard', mount: vi.fn(async () => ({ id: 'standard' })) },
     llm: { resolveModelInfo: vi.fn(async () => ({ inputModalities: ['text'] })) },
     agents: {
-      create: vi.fn(async (options: { sessionId?: string; setup?: (ctx: never) => Promise<void> }) => {
-        await options.setup?.({} as never)
+      create: vi.fn(async (options: { sessionId?: string; setup?: (ctx: never, agent: never) => Promise<void> }) => {
+        await options.setup?.({ systemPrompt: { section: vi.fn() } } as never, agent as never)
         registeredId = options.sessionId
         return {
           agent,

@@ -1,9 +1,10 @@
+import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
 import { Context } from '@deepseek-ai/cordis'
 import AgentRegistry from '@deepseek-ai/dsh-agent'
 import AgentLoop from '@deepseek-ai/dsh-agent-loop'
 import CommandRuntime from '@deepseek-ai/dsh-commands'
 import {
-  CallId,
+  ToolCallId,
   LlmAdapter,
   type GenerateOptions,
   type LlmResolvedModelInfo,
@@ -13,6 +14,7 @@ import LlmRuntime from '@deepseek-ai/dsh-llm'
 import SessionStore, {
   Session,
   SessionId,
+  SessionLogOffset,
   SessionPreparation,
   type SessionEvent,
   type SessionHeader,
@@ -40,7 +42,7 @@ function textResponse(text: string): StreamChunk[] {
 }
 
 function toolCallResponse(): StreamChunk[] {
-  const callId = CallId('call-list-files')
+  const callId = ToolCallId('call-list-files')
   const args = JSON.stringify({ path: '.' })
   return [
     { type: 'block-start', index: 0, blockType: 'text' },
@@ -59,7 +61,7 @@ function toolCallResponse(): StreamChunk[] {
 }
 
 function approvalToolCallResponse(): StreamChunk[] {
-  const callId = CallId('call-approved-bash')
+  const callId = ToolCallId('call-approved-bash')
   const args = JSON.stringify({ command: 'ls -la' })
   return [
     { type: 'block-start', index: 0, blockType: 'tool-call' },
@@ -97,7 +99,8 @@ async function toolHarness(adapter: ScriptedAdapter, persistence: object) {
   const ctx = new Context()
   await ctx.plugin(LlmRuntime)
   await ctx.plugin(SessionStore)
-  await ctx.plugin(SystemPrompt, { persona: '' })
+  await ctx.plugin(SessionProjectionRegistry)
+  await ctx.plugin(SystemPrompt, {})
   await ctx.plugin(CommandRuntime)
   await ctx.plugin(ApprovalService)
   await ctx.plugin(ToolRuntime)
@@ -137,7 +140,33 @@ async function toolHarness(adapter: ScriptedAdapter, persistence: object) {
     currentSelection: () => ({ provider: 'mock', model: 'mock' }),
   } as never)
   ctx.provide('agentPresets', { defaultId: 'standard', mount } as never)
-  ctx.provide('sessionPersistence', persistence as never)
+  const storedSessions = new Map<string, { header: SessionHeader; events: SessionEvent[] }>()
+  const legacy = persistence as { list(): Promise<SessionHeader[]>; inspect?: (id: SessionId) => Promise<{ meta: SessionHeader; events: SessionEvent[] }> }
+  function handle(id: SessionId, stored: { header: SessionHeader; events: SessionEvent[] }) {
+    return {
+      id, header: stored.header, inheritedEventCount: SessionLogOffset(0),
+      read: async () => ({ events: structuredClone(stored.events), eventState: 'detached' }),
+      append: async (events: readonly SessionEvent[]) => { stored.events.push(...structuredClone(events)) },
+      flush: async () => {}, close: async () => {},
+    }
+  }
+  ctx.provide('sessionPersistence', {
+    list: async () => (await legacy.list()).map(header => ({ header })),
+    create: async (header: SessionHeader) => {
+      const stored = { header, events: [] as SessionEvent[] }
+      storedSessions.set(String(header.id), stored)
+      return handle(header.id, stored)
+    },
+    open: async (id: SessionId) => {
+      if (legacy.inspect !== undefined) {
+        const snapshot = await legacy.inspect(id)
+        return handle(id, { header: snapshot.meta, events: structuredClone(snapshot.events) })
+      }
+      const stored = storedSessions.get(String(id))
+      if (stored === undefined) throw new Error('missing test session')
+      return handle(id, stored)
+    },
+  } as never)
   ctx.provide('attachments', {
     imageLimits: { maxImagesPerMessage: 4, maxMessageImageBytes: 10_000, maxImageBytes: 10_000 },
   } as never)
@@ -168,7 +197,7 @@ describe('ConversationManager real Agent Loop', () => {
 
       const agent = ctx.agents.get(SessionId(sessionIdFor('account-1', message)))
       if (agent === undefined) throw new Error('expected a live command integration-test Agent')
-      const commandEvents = agent.session.events.filter(event =>
+      const commandEvents = agent.session.snapshotEvents().filter(event =>
         event.type === 'command/run' || event.type === 'command/done')
       expect(commandEvents.map(event => event.type)).toEqual(['command/run', 'command/done'])
       expect(commandEvents[0]).toMatchObject({
@@ -183,7 +212,7 @@ describe('ConversationManager real Agent Loop', () => {
 
       await expect(manager.executeCommand(message, '/missing', { downloadImage: vi.fn() } as never))
         .resolves.toEqual({ kind: 'unknown', available: ['/probe'] })
-      expect(agent.session.events.filter(event =>
+      expect(agent.session.snapshotEvents().filter(event =>
         event.type === 'command/run' || event.type === 'command/done')).toHaveLength(2)
       expect(adapter.requests).toHaveLength(0)
     } finally {
@@ -210,7 +239,7 @@ describe('ConversationManager real Agent Loop', () => {
         return SessionPreparation.create(Session.fromRestore(
           id,
           structuredClone(stored.events),
-          structuredClone(stored.meta),
+          structuredClone(stored.meta), SessionLogOffset(0), 'detached',
         ))
       },
     }
@@ -229,11 +258,11 @@ describe('ConversationManager real Agent Loop', () => {
         .resolves.toEqual({ text: '旧会话回复', images: [], files: [] })
       const oldAgent = ctx.agents.get(baseId)
       if (oldAgent === undefined) throw new Error('expected the original Agent before /new')
-      const oldEvents = structuredClone([...oldAgent.session.events])
+      const oldEvents = structuredClone([...oldAgent.session.snapshotEvents()])
 
       await expect(first.startNewConversation(message)).resolves.toBeUndefined()
       expect(ctx.agents.get(baseId)).toBeUndefined()
-      expect(oldAgent.session.events).toEqual(oldEvents)
+      expect(oldAgent.session.snapshotEvents()).toEqual(oldEvents)
       expect(ctx.agents.get(rotatedId)).toBeDefined()
       expect(adapter.requests).toHaveLength(1)
 
@@ -244,7 +273,7 @@ describe('ConversationManager real Agent Loop', () => {
       expect(rotated.session.header.agentPreset).toBe('standard')
       stored = {
         meta: structuredClone(rotated.session.header),
-        events: structuredClone([...rotated.session.events]),
+        events: structuredClone([...rotated.session.snapshotEvents()]),
       }
       await first.dispose()
       expect(ctx.agents.get(rotatedId)).toBeUndefined()
@@ -281,7 +310,7 @@ describe('ConversationManager real Agent Loop', () => {
       const id = SessionId(sessionIdFor('account-1', message))
       const agent = ctx.agents.get(id)
       if (agent === undefined) throw new Error('expected a live integration-test Agent')
-      const events = agent.session.events
+      const events = agent.session.snapshotEvents()
 
       expect(reply).toEqual({ text: '当前文件：README.md', images: [], files: [] })
       expect(executionCount()).toBe(1)
@@ -291,7 +320,7 @@ describe('ConversationManager real Agent Loop', () => {
       expect(events.some(event => event.type === 'tool/call'
         && event.data.name === 'list_files')).toBe(true)
       expect(events.some(event => event.type === 'tool/result'
-        && event.data.message.source.callId === CallId('call-list-files'))).toBe(true)
+        && event.data.message.source.callId === ToolCallId('call-list-files'))).toBe(true)
       expect(events.some(event => event.type === 'turn/end'
         && event.data.reason.kind === 'completed')).toBe(true)
 
@@ -330,7 +359,7 @@ describe('ConversationManager real Agent Loop', () => {
       prepare: async (id: SessionId) => {
         if (stored === undefined) throw new Error('session has not been persisted')
         const snapshot = structuredClone(stored)
-        return SessionPreparation.create(Session.fromRestore(id, snapshot.events, snapshot.meta))
+        return SessionPreparation.create(Session.fromRestore(id, snapshot.events, snapshot.meta, SessionLogOffset(0), 'detached'))
       },
     }
     const { ctx, mount, executionCount } = await toolHarness(adapter, persistence)
@@ -349,7 +378,7 @@ describe('ConversationManager real Agent Loop', () => {
       if (original === undefined) throw new Error('expected the original live Agent')
       stored = {
         meta: structuredClone(original.session.header),
-        events: structuredClone([...original.session.events]),
+        events: structuredClone([...original.session.snapshotEvents()]),
       }
       await first.dispose()
       expect(ctx.agents.get(id)).toBeUndefined()
@@ -365,8 +394,8 @@ describe('ConversationManager real Agent Loop', () => {
       expect(restored.session.header.agentPreset).toBe('standard')
       expect(mount.mock.calls.map(call => call[1])).toEqual(['standard', 'standard'])
       expect(executionCount()).toBe(2)
-      expect(restored.session.events.filter(event => event.type === 'tool/call')).toHaveLength(2)
-      expect(restored.session.events.filter(event => event.type === 'tool/result')).toHaveLength(2)
+      expect(restored.session.snapshotEvents().filter(event => event.type === 'tool/call')).toHaveLength(2)
+      expect(restored.session.snapshotEvents().filter(event => event.type === 'tool/result')).toHaveLength(2)
       expect(adapter.requests).toHaveLength(4)
     } finally {
       await resumed?.dispose()
@@ -412,15 +441,15 @@ describe('ConversationManager real Agent Loop', () => {
       const agent = ctx.agents.get(SessionId(sessionIdFor('account-1', message)))
       if (agent === undefined) throw new Error('expected a live approval integration-test Agent')
       expect(executionCount()).toBe(1)
-      expect(agent.session.events.some(event => event.type === 'approval/asked')).toBe(true)
-      expect(agent.session.events.some(event => event.type === 'approval/decided'
+      expect(agent.session.snapshotEvents().some(event => event.type === 'approval/asked')).toBe(true)
+      expect(agent.session.snapshotEvents().some(event => event.type === 'approval/decided'
         && event.data.outcome === 'allowed-once')).toBe(true)
-      expect(agent.session.events.some(event => event.type === 'tool/call'
-        && event.data.callId === CallId('call-approved-bash')
+      expect(agent.session.snapshotEvents().some(event => event.type === 'tool/call'
+        && event.data.callId === ToolCallId('call-approved-bash')
         && event.data.name === 'bash')).toBe(true)
-      expect(agent.session.events.some(event => event.type === 'tool/result'
-        && event.data.message.source.callId === CallId('call-approved-bash'))).toBe(true)
-      expect(agent.session.events.some(event => event.type === 'turn/end'
+      expect(agent.session.snapshotEvents().some(event => event.type === 'tool/result'
+        && event.data.message.source.callId === ToolCallId('call-approved-bash'))).toBe(true)
+      expect(agent.session.snapshotEvents().some(event => event.type === 'turn/end'
         && event.data.reason.kind === 'completed')).toBe(true)
     } finally {
       await manager.dispose()

@@ -1,5 +1,8 @@
 # DeepSeek Harness 微信插件
 
+本机构建的兼容版本，面向 DeepSeek Harness 0.2.1-rc.2，基于上游提交 361927d701f664074b1ea72096f8e61c121a602d。适配预设投影、会话句柄、事件快照、命令附件、Agent 初始化与系统提示词注册；微信协议和保存的登录信息保持兼容。此版本并非上游官方发布。
+
+
 [English](README.md)
 
 基于腾讯官方 iLink/ClawBot 协议和扫码授权，为 [DeepSeek Harness](https://github.com/deepseek-ai/DeepSeek-Harness) 提供独立的微信私聊通道。

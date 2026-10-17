@@ -120,7 +120,7 @@ function formatApprovalPrompt(request, code, timeoutMs) {
   ].join("\n");
 }
 function approvalDetail(request) {
-  const call = request.callId === void 0 ? void 0 : [...request.agent.session.events].reverse().find((event) => event.type === "tool/call" && event.data.callId === request.callId);
+  const call = request.callId === void 0 ? void 0 : [...request.agent.session.snapshotEvents()].reverse().find((event) => event.type === "tool/call" && event.data.callId === request.callId);
   if (call?.type === "tool/call") {
     try {
       const parsed = JSON.parse(call.data.arguments);
@@ -141,7 +141,7 @@ function isRecord(value) {
 }
 
 // src/conversations.ts
-import { resolveSessionPreset } from "@deepseek-ai/dsh-agent-presets";
+import { agentPresetProjectionDefinition } from "@deepseek-ai/dsh-agent-preset-registry";
 import { parseCommand } from "@deepseek-ai/dsh-commands";
 import { createUserMessage } from "@deepseek-ai/dsh-llm";
 import { SessionId } from "@deepseek-ai/dsh-session";
@@ -457,7 +457,7 @@ var ConversationManager = class {
       this.ctx.permissionPresets.resolve(this.config.permissionPreset);
     }
     const headers = await this.ctx.sessionPersistence.list();
-    this.persistedIds = new Set(headers.map((header) => String(header.id)));
+    this.persistedIds = new Set(headers.map((snapshot) => String(snapshot.header.id)));
   }
   /** Process one inbound message after earlier work for the same Weixin user. */
   process(message, api, sendApprovalPrompt) {
@@ -534,7 +534,7 @@ var ConversationManager = class {
       agent.session.header?.cwd ?? this.config.cwd
     );
     await withTimeout(agent.whenIdle(), this.config.responseTimeoutMs, "DeepSeek Harness conversation availability");
-    const start = agent.session.events.length;
+    const start = agent.session.snapshotEvents().length;
     const userMessage = createUserMessage({ content, source: { kind: "user" } });
     const sendPrompt = sendApprovalPrompt ?? ((text) => {
       const to = message.from_user_id?.trim();
@@ -554,7 +554,7 @@ var ConversationManager = class {
         agent.cancel({ kind: "user" });
         throw error;
       }
-      return this.collectReply(agent, agent.session.events.slice(start), userMessage.id);
+      return this.collectReply(agent, agent.session.snapshotEvents().slice(start), userMessage.id);
     } finally {
       stopApprovalAnswerer();
     }
@@ -567,7 +567,7 @@ var ConversationManager = class {
     if (parsed === void 0) {
       return { kind: "unknown", available: this.ctx.commands.list(agent).map((command) => `/${command.name}`) };
     }
-    const start = agent.session.events.length;
+    const start = agent.session.snapshotEvents().length;
     const sendPrompt = sendApprovalPrompt ?? ((text) => {
       const to = message.from_user_id?.trim();
       if (!to) return Promise.reject(new Error("Weixin approval has no target user"));
@@ -583,7 +583,7 @@ var ConversationManager = class {
       controller.abort(new Error(`DeepSeek Harness command timed out after ${this.config.responseTimeoutMs}ms`));
     }, this.config.responseTimeoutMs);
     try {
-      const execution = await this.ctx.commands.execute(agent, line, controller.signal);
+      const execution = await this.ctx.commands.execute(agent, line, [], controller.signal);
       if (execution === void 0) {
         return { kind: "unknown", available: this.ctx.commands.list(agent).map((command) => `/${command.name}`) };
       }
@@ -594,7 +594,7 @@ var ConversationManager = class {
         agent.cancel({ kind: "user" });
         throw error;
       }
-      const generated = await this.collectLatestReply(agent, agent.session.events.slice(start));
+      const generated = await this.collectLatestReply(agent, agent.session.snapshotEvents().slice(start));
       const resultText = execution.result.kind === "error" ? `\u547D\u4EE4\u6267\u884C\u5931\u8D25\uFF1A${execution.result.text}` : execution.result.text?.trim() || `\u547D\u4EE4 /${parsed.name} \u5DF2\u6267\u884C\u3002`;
       return {
         kind: "handled",
@@ -692,16 +692,22 @@ var ConversationManager = class {
     const current = this.ctx.agentDefaultModel.currentSelection();
     const agentOptions = { provider: current.provider, model: current.model };
     if (this.persistedIds.has(id)) {
-      const inspected = await this.ctx.sessionPersistence.inspect(sessionId);
-      const agentPreset2 = resolveSessionPreset({
-        header: inspected.meta,
-        events: inspected.events
-      }) ?? this.resolveAgentPreset();
+      const stored = await this.ctx.sessionPersistence.open(sessionId, "read");
+      let agentPreset2;
+      try {
+        const { events } = await stored.read();
+        agentPreset2 = events.reduce(
+          agentPresetProjectionDefinition.apply,
+          agentPresetProjectionDefinition.init(stored.header)
+        ) ?? this.resolveAgentPreset();
+      } finally {
+        await stored.close();
+      }
       try {
         return this.ownAgent(await this.ctx.agents.resume({
           resumeSessionId: sessionId,
           agentOptions,
-          setup: (agentCtx) => this.setupAgent(agentCtx, agentPreset2)
+          setup: (agentCtx, agent) => this.setupAgent(agentCtx, agent, agentPreset2)
         }));
       } catch (error) {
         const raced = this.ctx.agents.get(sessionId);
@@ -716,7 +722,7 @@ var ConversationManager = class {
         sessionId,
         meta: { cwd: this.config.cwd, agentPreset },
         agentOptions,
-        setup: (agentCtx) => this.setupAgent(agentCtx, agentPreset, this.config.permissionPreset)
+        setup: (agentCtx, agent) => this.setupAgent(agentCtx, agent, agentPreset, this.config.permissionPreset)
       });
     } catch (error) {
       const raced = this.ctx.agents.get(sessionId);
@@ -724,10 +730,6 @@ var ConversationManager = class {
       throw error;
     }
     this.persistedIds.add(id);
-    handle.agent.inject(createUserMessage({
-      content: [{ type: "text", text: this.config.systemPrompt }],
-      source: { kind: "plugin", plugin: "deepseek-harness-weixin", form: "instructions" }
-    }));
     return this.ownAgent(handle);
   }
   ownAgent(handle) {
@@ -739,11 +741,15 @@ var ConversationManager = class {
   resolveAgentPreset() {
     return this.config.agentPreset ?? this.ctx.agentPresets.defaultId;
   }
-  async setupAgent(agentCtx, agentPreset, permissionPreset) {
+  async setupAgent(agentCtx, agent, agentPreset, permissionPreset) {
     await this.ctx.agentPresets.mount(agentCtx, agentPreset);
+    agentCtx.systemPrompt.section({
+      name: "weixin-channel",
+      order: 80,
+      text: this.config.systemPrompt,
+      interpolate: false
+    });
     if (permissionPreset !== void 0) {
-      const agent = agentCtx.agent;
-      if (agent === void 0) throw new Error("weixin-channel: Agent setup context has no Agent");
       this.ctx.permissionPresets.set(agent.session, permissionPreset);
     }
   }
@@ -1769,7 +1775,8 @@ var inject = [
   "credentials",
   "llm",
   "permissionPresets",
-  "sessionPersistence"
+  "sessionPersistence",
+  "systemPrompt"
 ];
 function mountBridge(ctx, bridge, control) {
   ctx.effect(() => {
