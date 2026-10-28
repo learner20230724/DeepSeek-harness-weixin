@@ -98,7 +98,7 @@ describe('standalone Weixin login', () => {
     expect(JSON.parse(entries.refs.get(CREDENTIAL_REF) ?? '')).toEqual(NEW_CREDENTIAL)
   })
 
-  it('stores a writable local override over an environment credential in DSH 0.2', async () => {
+  it('preserves read-only environment credentials with the pinned DSH 0.2.0 provider', async () => {
     await temporaryDshHome()
     vi.stubEnv(CREDENTIAL_REF, JSON.stringify(OLD_CREDENTIAL))
     const login = vi.fn(async () => NEW_CREDENTIAL)
@@ -108,7 +108,8 @@ describe('standalone Weixin login', () => {
       timeoutMs: 300_000,
       showQr: vi.fn(async () => undefined),
       status: vi.fn(),
-    }, login as never)).resolves.toEqual(NEW_CREDENTIAL)
-    expect(login).toHaveBeenCalledOnce()
+    }, login as never)).rejects.toThrow('由启动环境提供，无法被登录命令覆盖')
+    expect(login).not.toHaveBeenCalled()
+    expect(process.env[CREDENTIAL_REF]).toBe(JSON.stringify(OLD_CREDENTIAL))
   })
 })

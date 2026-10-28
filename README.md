@@ -1,6 +1,6 @@
 # DeepSeek Harness Weixin
 
-Local compatibility build for DeepSeek Harness 0.2.1-rc.2, based on upstream commit 361927d701f664074b1ea72096f8e61c121a602d. Adapts preset projection, session handles, event snapshots, command attachments, Agent setup, and system-prompt registration. The Weixin wire protocol and saved credentials remain compatible. This is not an upstream release.
+Local compatibility build for DeepSeek Harness 0.2.0-rc.2, based on upstream commit 361927d701f664074b1ea72096f8e61c121a602d. Adapts preset projection, session handles, event snapshots, command attachments, Agent setup, and system-prompt registration. The Weixin wire protocol and saved credentials remain compatible. This is not an upstream release.
 
 
 [简体中文](README.zh.md)
